@@ -1,0 +1,187 @@
+name: Build Turnip (Android arm64)
+
+on:
+  push:
+    branches: ['**']
+    tags: ['**']
+  workflow_dispatch:
+    inputs:
+      api_level:
+        description: 'Android API level (clang target and platform-sdk-version)'
+        required: false
+        default: '34'
+      buildtype:
+        description: 'Meson buildtype'
+        required: false
+        default: 'release'
+        type: choice
+        options: [release, debugoptimized, debug]
+      extra_meson_args:
+        description: 'Extra meson setup arguments (optional)'
+        required: false
+        default: ''
+
+concurrency:
+  group: turnip-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NDK_VERSION: r30
+  NDK_SHA1: 5107f898313790e449e87eee2183d9a20602dee9
+  API_LEVEL: ${{ github.event.inputs.api_level || '34' }}
+  BUILDTYPE: ${{ github.event.inputs.buildtype || 'release' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build bison flex pkg-config glslang-tools \
+            python3-pip python3-venv zip unzip curl patchelf
+          # Mesa needs a recent meson, so use pip rather than apt
+          python3 -m venv "$HOME/venv"
+          "$HOME/venv/bin/pip" install --upgrade pip
+          "$HOME/venv/bin/pip" install meson mako pyyaml packaging ply
+          echo "$HOME/venv/bin" >> "$GITHUB_PATH"
+
+      - name: Cache Android NDK
+        id: ndk-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/android-ndk-${{ env.NDK_VERSION }}
+          key: android-ndk-${{ env.NDK_VERSION }}-linux
+
+      - name: Download Android NDK ${{ env.NDK_VERSION }}
+        if: steps.ndk-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -fL -o "$RUNNER_TEMP/ndk.zip" \
+            "https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip"
+          echo "${NDK_SHA1}  $RUNNER_TEMP/ndk.zip" | sha1sum -c -
+          unzip -q "$RUNNER_TEMP/ndk.zip" -d "$HOME"
+          rm "$RUNNER_TEMP/ndk.zip"
+
+      - name: Set up ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: turnip-ndk-${{ env.NDK_VERSION }}-api${{ env.API_LEVEL }}
+          max-size: 1G
+
+      - name: Create Meson cross file
+        run: |
+          NDK="$HOME/android-ndk-${NDK_VERSION}"
+          BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          test -x "$BIN/aarch64-linux-android${API_LEVEL}-clang" || { echo "NDK toolchain not found"; ls "$BIN" | head; exit 1; }
+
+          cat > "$RUNNER_TEMP/android-aarch64.ini" <<EOF
+          [binaries]
+          ar = '$BIN/llvm-ar'
+          c = ['ccache', '$BIN/aarch64-linux-android${API_LEVEL}-clang']
+          cpp = ['ccache', '$BIN/aarch64-linux-android${API_LEVEL}-clang++', '-fno-exceptions', '-fno-unwind-tables', '-fno-asynchronous-unwind-tables', '-static-libstdc++', '-Wno-c++11-narrowing']
+          c_ld = 'lld'
+          cpp_ld = 'lld'
+          strip = '$BIN/llvm-strip'
+          pkg-config = ['env', 'PKG_CONFIG_LIBDIR=NDKDIR/pkg-config', '/usr/bin/pkg-config']
+
+          [host_machine]
+          system = 'android'
+          cpu_family = 'aarch64'
+          cpu = 'armv8'
+          endian = 'little'
+          EOF
+          # Strip the heredoc indentation
+          sed -i 's/^          //' "$RUNNER_TEMP/android-aarch64.ini"
+          cat "$RUNNER_TEMP/android-aarch64.ini"
+
+      - name: Configure (meson)
+        run: |
+          meson setup build \
+            --cross-file "$RUNNER_TEMP/android-aarch64.ini" \
+            --wrap-mode=default \
+            -Dbuildtype="${BUILDTYPE}" \
+            -Dstrip=true \
+            -Dplatforms=android \
+            -Dplatform-sdk-version="${API_LEVEL}" \
+            -Dandroid-stub=true \
+            -Dandroid-libbacktrace=disabled \
+            -Dgallium-drivers= \
+            -Dvulkan-drivers=freedreno \
+            -Dfreedreno-kmds=kgsl \
+            -Dvulkan-beta=true \
+            -Dllvm=disabled \
+            -Degl=disabled \
+            -Dgbm=disabled \
+            -Dglx=disabled \
+            -Dgles1=disabled \
+            -Dgles2=disabled \
+            -Dopengl=false \
+            -Dshared-glapi=disabled \
+            -Dvideo-codecs= \
+            -Dxmlconfig=disabled \
+            ${{ github.event.inputs.extra_meson_args }}
+
+      - name: Build
+        run: ninja -C build -j"$(nproc)"
+
+      - name: Package
+        id: pkg
+        run: |
+          set -e
+          VER="$(cat VERSION | tr -d '[:space:]')"
+          SHORT="${GITHUB_SHA::8}"
+          BRANCH="${GITHUB_REF_NAME//\//-}"
+          NAME="turnip-${VER}-${BRANCH}-${SHORT}-api${API_LEVEL}"
+
+          LIB="$(find build -name 'libvulkan_freedreno.so' | head -n1)"
+          ICD="$(find build -name 'freedreno_icd*.json' | head -n1)"
+          test -f "$LIB" || { echo "libvulkan_freedreno.so not found"; exit 1; }
+
+          mkdir -p out
+          cp "$LIB" out/libvulkan_freedreno.so
+          [ -n "$ICD" ] && cp "$ICD" out/ || true
+
+          # libadrenotools-style driver package metadata
+          cat > out/meta.json <<EOF
+          {
+            "schemaVersion": 1,
+            "name": "Turnip ${VER} (${BRANCH}@${SHORT})",
+            "description": "Mesa Turnip built from ${GITHUB_REPOSITORY} @ ${GITHUB_SHA}",
+            "author": "${GITHUB_REPOSITORY_OWNER}",
+            "packageVersion": "1",
+            "vendor": "Mesa",
+            "driverVersion": "${VER}",
+            "minApi": ${API_LEVEL},
+            "libraryName": "libvulkan_freedreno.so"
+          }
+          EOF
+          sed -i 's/^          //' out/meta.json
+
+          (cd out && zip -9 "../${NAME}.zip" *)
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+          ls -lh out "${NAME}.zip"
+
+      - name: Upload artifact (zip)
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: ${{ steps.pkg.outputs.name }}.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: meson-logs-${{ github.run_id }}
+          path: build/meson-logs/
+          if-no-files-found: ignore
+          retention-days: 7
